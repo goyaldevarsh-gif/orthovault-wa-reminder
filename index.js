@@ -259,6 +259,13 @@ async function startWhatsApp() {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const loggedOut = statusCode === DisconnectReason.loggedOut;
       console.log(`Connection closed (${statusCode}). Logged out: ${loggedOut}.`);
+      if (lastDisconnect?.error) {
+        console.log('--- Full error detail ---');
+        console.log('Message:', lastDisconnect.error.message);
+        console.log('Stack:', lastDisconnect.error.stack);
+        if (lastDisconnect.error.output) console.log('Output:', JSON.stringify(lastDisconnect.error.output));
+        console.log('--------------------------');
+      }
       if (loggedOut) {
         console.error('Session was unlinked from the phone — delete the auth_session Volume contents and redeploy to re-link.');
       } else {
