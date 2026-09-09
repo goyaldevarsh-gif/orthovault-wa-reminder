@@ -149,10 +149,12 @@ function buildReminderMessage(patientName, nextFollowUpDate, isOverdue, doctorNa
   const rescheduleLine = clinicPhone
     ? `\n\nअगर आप नहीं आ पा रहे, कृपया ${clinicPhone} पर कॉल करके नई तारीख तय कर लें, ताकि इलाज बीच में न रुके।`
     : '';
+  const replyBlock = `\n\nरिप्लाई करें / Please reply:\n✅ आ रहे हैं? "YES" लिखें\n📅 डेट बदलनी है? नई डेट लिखें (जैसे: 20/9)`;
   return `नमस्ते ${patientName} जी,`
     + dateLine
     + `\n\nकृपया साथ लाएं:\n✅ पुराने X-ray/MRI/CT रिपोर्ट\n✅ चल रही दवाइयां`
     + rescheduleLine
+    + replyBlock
     + `\n\nधन्यवाद,\n${doctorName || 'आपका डॉक्टर'}`
     + (signature || '');
 }
@@ -194,6 +196,57 @@ function generateSignature(profile) {
 }
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+// ---- Incoming reply handling ("YES" to confirm, or a date like "20/9" to reschedule) ----
+
+function isValidDayMonth(day, month) {
+  if (month < 1 || month > 12) return false;
+  const daysInMonth = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]; // Feb given 29 as a safe upper bound
+  return day >= 1 && day <= daysInMonth[month - 1];
+}
+
+function parseReplyIntent(rawText) {
+  const text = (rawText || '').trim().toLowerCase();
+  if (!text) return { type: 'unknown' };
+
+  const yesWords = ['yes', 'y', 'ok', 'okay', 'haan', 'ha', 'हाँ', 'हां', 'theek', 'thik', 'ठीक'];
+  if (yesWords.includes(text)) return { type: 'confirm' };
+
+  const dateMatch = text.match(/^(\d{1,2})[\/\-.](\d{1,2})(?:[\/\-.](\d{2,4}))?$/);
+  if (dateMatch) {
+    const day = parseInt(dateMatch[1], 10);
+    const month = parseInt(dateMatch[2], 10);
+    let year = dateMatch[3] ? parseInt(dateMatch[3], 10) : new Date().getFullYear();
+    if (dateMatch[3] && dateMatch[3].length === 2) year += 2000;
+    if (!isValidDayMonth(day, month)) return { type: 'unknown' };
+
+    let dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    if (dateStr < todayDateString()) {
+      // Patient didn't specify a year and the date has already passed this year \u2014 assume they mean next year
+      dateStr = `${year + 1}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    }
+    return { type: 'date', date: dateStr };
+  }
+
+  return { type: 'unknown' };
+}
+
+async function findPatientByWhatsapp(senderDigits) {
+  // Broad scan across every doctor's patients \u2014 fine at this scale (a handful of solo practices),
+  // would need a proper phone-indexed lookup if this ever needs to handle many doctors/patients.
+  const snapshot = await db.collectionGroup('patients').get();
+  for (const docSnap of snapshot.docs) {
+    const patient = docSnap.data();
+    if (!patient.whatsapp) continue;
+    let patientDigits = String(patient.whatsapp).replace(/\D/g, '');
+    if (patientDigits.length === 10) patientDigits = '91' + patientDigits;
+    if (patientDigits === senderDigits) {
+      return { ref: docSnap.ref, data: patient };
+    }
+  }
+  return null;
+}
+
 
 // ---- The actual daily job: find today's follow-ups, message each one ----
 async function runDailyReminderJob(sock) {
@@ -269,6 +322,45 @@ async function startWhatsApp() {
   });
 
   sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+    for (const msg of messages) {
+      try {
+        if (msg.key.fromMe) continue; // ignore our own outgoing messages
+        if (msg.key.remoteJid && msg.key.remoteJid.endsWith('@g.us')) continue; // ignore group chats
+        const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
+        if (!text.trim()) continue;
+
+        const senderJid = msg.key.remoteJid;
+        const senderDigits = senderJid.replace('@s.whatsapp.net', '').replace(/\D/g, '');
+
+        const intent = parseReplyIntent(text);
+        if (intent.type === 'unknown') {
+          console.log(`Reply from ${senderDigits}: "${text}" \u2014 not recognized, ignoring (no auto-reply sent).`);
+          continue;
+        }
+
+        const match = await findPatientByWhatsapp(senderDigits);
+        if (!match) {
+          console.log(`Reply from ${senderDigits}: "${text}" \u2014 no matching patient found, ignoring.`);
+          continue;
+        }
+
+        if (intent.type === 'confirm') {
+          await match.ref.set({ followUpConfirmedAt: Date.now() }, { merge: true });
+          console.log(`\u2713 ${match.data.name} confirmed their visit.`);
+          await sock.sendMessage(senderJid, { text: 'धन्यवाद! आपकी विज़िट कन्फर्म हो गई है। ✅' });
+        } else if (intent.type === 'date') {
+          await match.ref.set({ nextFollowUpDate: intent.date, followUpConfirmedAt: null }, { merge: true });
+          console.log(`\u2713 ${match.data.name} rescheduled to ${intent.date}.`);
+          await sock.sendMessage(senderJid, { text: `धन्यवाद! आपकी नई तारीख ${formatDateForMessage(intent.date)} पर सेट हो गई है। ✅` });
+        }
+      } catch (err) {
+        console.error('Error processing incoming reply:', err.message);
+      }
+    }
+  });
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
