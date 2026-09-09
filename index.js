@@ -117,6 +117,11 @@ function todayDateString() {
   const ist = new Date(Date.now() + istOffsetMs);
   return ist.toISOString().slice(0, 10);
 }
+function tomorrowDateString() {
+  const istOffsetMs = 5.5 * 60 * 60 * 1000;
+  const ist = new Date(Date.now() + istOffsetMs + 24 * 60 * 60 * 1000);
+  return ist.toISOString().slice(0, 10);
+}
 function todayDateStringFromMillis(ms) {
   const istOffsetMs = 5.5 * 60 * 60 * 1000;
   const ist = new Date(ms + istOffsetMs);
@@ -136,7 +141,7 @@ function toWaJid(raw) {
   if (digits.length === 10) digits = '91' + digits;
   return digits + '@s.whatsapp.net';
 }
-function buildReminderMessage(patientName, nextFollowUpDate, isOverdue, doctorName, clinicPhone) {
+function buildReminderMessage(patientName, nextFollowUpDate, isOverdue, doctorName, clinicPhone, signature) {
   const dateFormatted = formatDateForMessage(nextFollowUpDate);
   const dateLine = isOverdue
     ? `\nआपकी फॉलो-अप विज़िट ${dateFormatted} को रखी गई थी।`
@@ -148,19 +153,22 @@ function buildReminderMessage(patientName, nextFollowUpDate, isOverdue, doctorNa
     + dateLine
     + `\n\nकृपया साथ लाएं:\n✅ पुराने X-ray/MRI/CT रिपोर्ट\n✅ चल रही दवाइयां`
     + rescheduleLine
-    + `\n\nधन्यवाद,\n${doctorName || 'आपका डॉक्टर'}`;
+    + `\n\nधन्यवाद,\n${doctorName || 'आपका डॉक्टर'}`
+    + (signature || '');
 }
 
 const doctorProfileCache = new Map();
 async function getDoctorProfileFields(uid) {
   if (doctorProfileCache.has(uid)) return doctorProfileCache.get(uid);
-  let result = { doctorName: 'Your Doctor', clinicPhone: '' };
+  let result = { doctorName: 'Your Doctor', clinicPhone: '', specialty: '', clinicAddresses: [] };
   try {
     const doc = await db.collection('users').doc(uid).collection('meta').doc('profile').get();
     if (doc.exists) {
       const data = doc.data();
       if (data.doctorName) result.doctorName = data.doctorName;
       if (data.clinicPhone) result.clinicPhone = data.clinicPhone;
+      if (data.specialty) result.specialty = data.specialty;
+      if (Array.isArray(data.clinicAddresses)) result.clinicAddresses = data.clinicAddresses;
     }
   } catch (e) {
     console.warn(`Could not load doctor profile for ${uid}:`, e.message);
@@ -169,20 +177,37 @@ async function getDoctorProfileFields(uid) {
   return result;
 }
 
+// Mirrors index.html's generateWhatsAppSignature() exactly \u2014 same clinic list,
+// timings and maps links, so this automated message reads identically to one
+// sent manually from the app.
+function generateSignature(profile) {
+  if (!profile.clinicAddresses || !profile.clinicAddresses.length) return '';
+  const specialty = profile.specialty || 'Orthopaedic Surgeon';
+  const primaryClinic = profile.clinicAddresses[0].name || 'Clinic';
+  let sig = `\n${specialty.trim()} (${primaryClinic.trim()})`;
+  profile.clinicAddresses.forEach(clinic => {
+    sig += `\n\ud83d\udccd ${clinic.name}`;
+    if (clinic.timings) sig += ` (${clinic.timings})`;
+    sig += `\n${clinic.mapsLink || ''}`;
+  });
+  return sig;
+}
+
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 // ---- The actual daily job: find today's follow-ups, message each one ----
 async function runDailyReminderJob(sock) {
   const today = todayDateString();
-  console.log(`\n[${new Date().toISOString()}] Checking for follow-ups due ${today}...`);
+  const tomorrow = tomorrowDateString();
+  console.log(`\n[${new Date().toISOString()}] Checking for follow-ups due tomorrow (${tomorrow})...`);
 
-  const snapshot = await db.collectionGroup('patients').where('nextFollowUpDate', '==', today).get();
+  const snapshot = await db.collectionGroup('patients').where('nextFollowUpDate', '==', tomorrow).get();
   if (snapshot.empty) {
-    console.log('No follow-ups due today. Nothing to send.');
-    lastRunSummary = `${today}: nothing due.`;
+    console.log('No follow-ups due tomorrow. Nothing to send.');
+    lastRunSummary = `${tomorrow}: nothing due.`;
     return;
   }
-  console.log(`Found ${snapshot.size} patient(s) due today.`);
+  console.log(`Found ${snapshot.size} patient(s) due tomorrow.`);
 
   let sent = 0, skipped = 0, failed = 0;
   for (const docSnap of snapshot.docs) {
@@ -192,14 +217,15 @@ async function runDailyReminderJob(sock) {
 
     try {
       if (patient.lastAutoReminderSentAt && todayDateStringFromMillis(patient.lastAutoReminderSentAt) === today) {
-        skipped++; continue; // already messaged today, don't double-send on a restart/retry
+        skipped++; continue; // already messaged today (job-run-day), don't double-send on a restart/retry
       }
       const jid = toWaJid(patient.whatsapp);
       if (!jid) { skipped++; continue; } // no WhatsApp number on file
 
-      const { doctorName, clinicPhone } = await getDoctorProfileFields(doctorUid);
-      const isOverdue = patient.nextFollowUpDate < today; // false here since we queried an exact match, kept for message-text parity
-      const message = buildReminderMessage(patient.name || 'Patient', patient.nextFollowUpDate, isOverdue, doctorName, clinicPhone);
+      const profile = await getDoctorProfileFields(doctorUid);
+      const isOverdue = false; // always false here \u2014 we're reminding a day ahead, never for a past date
+      const signature = generateSignature(profile);
+      const message = buildReminderMessage(patient.name || 'Patient', patient.nextFollowUpDate, isOverdue, profile.doctorName, profile.clinicPhone, signature);
 
       await sock.sendMessage(jid, { text: message });
       await patientRef.set({ lastAutoReminderSentAt: Date.now() }, { merge: true });
@@ -211,7 +237,7 @@ async function runDailyReminderJob(sock) {
       console.error(`  ✗ Failed for ${patient.name || docSnap.id}:`, err.message);
     }
   }
-  lastRunSummary = `${today}: sent ${sent}, skipped ${skipped}, failed ${failed}.`;
+  lastRunSummary = `${tomorrow}: sent ${sent}, skipped ${skipped}, failed ${failed}.`;
   console.log(`Done. Sent: ${sent}, Skipped: ${skipped}, Failed: ${failed}.`);
 }
 
@@ -294,7 +320,7 @@ function scheduleDailyJob(sock) {
 
   // Optional: uncomment to run once immediately on startup for testing,
   // instead of waiting for the next 9 AM slot.
-  runDailyReminderJob(sock).catch(err => console.error('Manual test run crashed:', err));
+  // runDailyReminderJob(sock).catch(err => console.error('Manual test run crashed:', err));
 }
 
 startWhatsApp().catch(err => {
