@@ -294,7 +294,7 @@ function scheduleDailyJob(sock) {
 
   // Optional: uncomment to run once immediately on startup for testing,
   // instead of waiting for the next 9 AM slot.
-  // runDailyReminderJob(sock).catch(err => console.error('Manual test run crashed:', err));
+  runDailyReminderJob(sock).catch(err => console.error('Manual test run crashed:', err));
 }
 
 startWhatsApp().catch(err => {
