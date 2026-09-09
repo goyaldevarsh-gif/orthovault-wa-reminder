@@ -44,7 +44,7 @@
  *    again unless the Volume is deleted or the phone unlinks the device.
  */
 
-const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
 const qrcodeTerminal = require('qrcode-terminal');
 const QRCode = require('qrcode');
 const pino = require('pino');
@@ -218,13 +218,28 @@ async function runDailyReminderJob(sock) {
 // ---- Baileys connection lifecycle ----
 async function startWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_SESSION_DIR);
-  const { version } = await fetchLatestBaileysVersion();
+
+  // WhatsApp has been rejecting Baileys' default "Web" platform identification
+  // since Feb 2026, and fetchLatestBaileysVersion() can return a stale cached
+  // value that WhatsApp no longer accepts. Both fixes below are widely reported
+  // as necessary as of mid-2026 \u2014 see WhiskeySockets/Baileys#2248 and related.
+  const KNOWN_GOOD_VERSION = [2, 3000, 1044015310]; // last confirmed-working WA Web version as of Jul 2026
+  let version = KNOWN_GOOD_VERSION;
+  try {
+    const fetched = await fetchLatestBaileysVersion();
+    if (fetched && fetched.version && fetched.version[2] > KNOWN_GOOD_VERSION[2]) {
+      version = fetched.version; // only trust the fetched value if it's genuinely newer
+    }
+  } catch (e) {
+    console.warn('Could not fetch latest WA version, using known-good fallback:', e.message);
+  }
 
   const sock = makeWASocket({
     version,
     auth: state,
     logger: pino({ level: 'warn' }), // 'silent' if the connection logs feel noisy once things are stable
     printQRInTerminal: false, // we handle QR display ourselves (terminal + web page) below
+    browser: Browsers.macOS('Desktop'), // avoids the Platform.WEB rejection issue above
   });
 
   sock.ev.on('creds.update', saveCreds);
