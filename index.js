@@ -197,6 +197,47 @@ function generateSignature(profile) {
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
+// ---- Proactive LID resolution ----
+// WhatsApp's LID privacy system (see resolveSenderPhoneDigits below for background) means an
+// incoming reply's remoteJid is often an opaque @lid with no direct link back to the phone
+// number. Rather than only reacting to each incoming message, this proactively asks WhatsApp
+// "what identity does patient X's phone number currently resolve to?" for every patient with a
+// WhatsApp number on file, via the official onWhatsApp() lookup \u2014 then caches LID\u2192patient
+// directly, so a reply resolves instantly regardless of which identity format it arrives as.
+let LID_TO_PATIENT_MAP = new Map(); // lidDigits (string) -> { ref, data }
+let PHONE_MAP_BUILT_AT = 0;
+
+async function buildPhoneToLidMap(sock) {
+  const snapshot = await db.collectionGroup('patients').get();
+  const patientsWithPhone = [];
+  for (const docSnap of snapshot.docs) {
+    const patient = docSnap.data();
+    if (!patient.whatsapp) continue;
+    let digits = String(patient.whatsapp).replace(/\D/g, '');
+    if (digits.length === 10) digits = '91' + digits;
+    patientsWithPhone.push({ ref: docSnap.ref, data: patient, digits });
+  }
+  const newMap = new Map();
+  if (!patientsWithPhone.length) { LID_TO_PATIENT_MAP = newMap; PHONE_MAP_BUILT_AT = Date.now(); return; }
+
+  // Queried one at a time (rather than in bulk) so each result can be reliably paired back
+  // to the specific patient it came from \u2014 onWhatsApp's bulk response doesn't guarantee
+  // input order is preserved for @lid results.
+  for (const p of patientsWithPhone) {
+    try {
+      const results = await sock.onWhatsApp(p.digits);
+      const result = (results || [])[0];
+      if (result && result.exists && result.jid && result.jid.includes('@lid')) {
+        const lidDigits = result.jid.replace('@lid', '').replace(/\D/g, '');
+        newMap.set(lidDigits, { ref: p.ref, data: p.data });
+      }
+    } catch (e) { /* skip this patient, try the rest */ }
+  }
+  LID_TO_PATIENT_MAP = newMap;
+  PHONE_MAP_BUILT_AT = Date.now();
+  console.log(`LID map built: ${LID_TO_PATIENT_MAP.size} of ${patientsWithPhone.length} patients resolved to a LID.`);
+}
+
 // ---- Incoming reply handling ("YES" to confirm, or a date like "20/9" to reschedule) ----
 
 function isValidDayMonth(day, month) {
@@ -367,22 +408,33 @@ async function startWhatsApp() {
 
         console.log(`[DEBUG] Raw message key:`, JSON.stringify(msg.key));
         const senderJid = msg.key.remoteJid; // used to reply \u2014 WhatsApp accepts this even when it's a @lid
-        const senderDigits = await resolveSenderPhoneDigits(msg);
-        if (!senderDigits) {
-          console.log(`Reply with text "${text}" \u2014 could not resolve sender's phone number from this WhatsApp identity (LID unmapped), ignoring.`);
-          continue;
-        }
-        console.log(`[DEBUG] Resolved sender phone digits: ${senderDigits}`);
 
         const intent = parseReplyIntent(text);
         if (intent.type === 'unknown') {
-          console.log(`Reply from ${senderDigits}: "${text}" \u2014 not recognized, ignoring (no auto-reply sent).`);
+          console.log(`Reply with text "${text}" \u2014 not recognized, ignoring (no auto-reply sent).`);
           continue;
         }
 
-        const match = await findPatientByWhatsapp(senderDigits);
+        // Fast path: this sender's LID was already mapped to a patient proactively (see buildPhoneToLidMap).
+        let match = null;
+        let senderDigits = null;
+        if (senderJid.includes('@lid')) {
+          const lidDigits = senderJid.replace('@lid', '').replace(/\D/g, '');
+          match = LID_TO_PATIENT_MAP.get(lidDigits) || null;
+        }
+        // Fallback: resolve to a phone number the old way, then scan patients by phone.
         if (!match) {
-          console.log(`Reply from ${senderDigits}: "${text}" \u2014 no matching patient found, ignoring.`);
+          senderDigits = await resolveSenderPhoneDigits(msg);
+          if (!senderDigits) {
+            console.log(`Reply with text "${text}" \u2014 could not resolve sender's phone number from this WhatsApp identity (LID unmapped), ignoring.`);
+            continue;
+          }
+          console.log(`[DEBUG] Resolved sender phone digits: ${senderDigits}`);
+          match = await findPatientByWhatsapp(senderDigits);
+        }
+
+        if (!match) {
+          console.log(`Reply from ${senderDigits || senderJid}: "${text}" \u2014 no matching patient found, ignoring.`);
           continue;
         }
 
@@ -434,6 +486,7 @@ async function startWhatsApp() {
       lastQrDataUrl = null;
       console.log('✅ WhatsApp connected.');
       scheduleDailyJob(sock);
+      buildPhoneToLidMap(sock).catch(err => console.error('Initial LID map build failed:', err.message));
     }
   });
 
@@ -445,6 +498,7 @@ function scheduleDailyJob(sock) {
   if (cronScheduled) return; // avoid double-scheduling across reconnects
   cronScheduled = true;
   cron.schedule(DAILY_CRON_SCHEDULE, () => {
+    buildPhoneToLidMap(sock).catch(err => console.error('Daily LID map rebuild failed:', err.message));
     runDailyReminderJob(sock).catch(err => console.error('Daily job crashed:', err));
   }, { timezone: CRON_TIMEZONE });
   console.log(`Scheduled daily reminder run for ${DAILY_CRON_SCHEDULE} (${CRON_TIMEZONE}).`);
