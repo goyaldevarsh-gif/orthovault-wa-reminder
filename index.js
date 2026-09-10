@@ -235,15 +235,20 @@ async function findPatientByWhatsapp(senderDigits) {
   // Broad scan across every doctor's patients \u2014 fine at this scale (a handful of solo practices),
   // would need a proper phone-indexed lookup if this ever needs to handle many doctors/patients.
   const snapshot = await db.collectionGroup('patients').get();
+  let scannedWithPhone = 0;
+  const sampleNumbers = [];
   for (const docSnap of snapshot.docs) {
     const patient = docSnap.data();
     if (!patient.whatsapp) continue;
+    scannedWithPhone++;
     let patientDigits = String(patient.whatsapp).replace(/\D/g, '');
     if (patientDigits.length === 10) patientDigits = '91' + patientDigits;
+    if (sampleNumbers.length < 5) sampleNumbers.push(`${patient.name || '?'}: raw="${patient.whatsapp}" normalized="${patientDigits}"`);
     if (patientDigits === senderDigits) {
       return { ref: docSnap.ref, data: patient };
     }
   }
+  console.log(`No match for sender "${senderDigits}". Scanned ${scannedWithPhone} patient(s) with a WhatsApp number. Sample: ${JSON.stringify(sampleNumbers)}`);
   return null;
 }
 
@@ -333,6 +338,7 @@ async function startWhatsApp() {
         if (!text.trim()) continue;
 
         const senderJid = msg.key.remoteJid;
+        console.log(`[DEBUG] Raw message key:`, JSON.stringify(msg.key));
         const senderDigits = senderJid.replace('@s.whatsapp.net', '').replace(/\D/g, '');
 
         const intent = parseReplyIntent(text);
