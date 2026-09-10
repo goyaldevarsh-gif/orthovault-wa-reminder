@@ -130,8 +130,8 @@ function todayDateStringFromMillis(ms) {
 function formatDateForMessage(dateStr) {
   try {
     const d = new Date(dateStr + 'T00:00:00+05:30');
-    const withDay = d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
-    const dayName = d.toLocaleDateString('en-IN', { weekday: 'short' });
+    const withDay = d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'Asia/Kolkata' });
+    const dayName = d.toLocaleDateString('en-IN', { weekday: 'short', timeZone: 'Asia/Kolkata' });
     return withDay + ' (' + dayName + ')';
   } catch (e) { return dateStr; }
 }
