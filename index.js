@@ -448,6 +448,7 @@ function scheduleDailyJob(sock) {
     runDailyReminderJob(sock).catch(err => console.error('Daily job crashed:', err));
   }, { timezone: CRON_TIMEZONE });
   console.log(`Scheduled daily reminder run for ${DAILY_CRON_SCHEDULE} (${CRON_TIMEZONE}).`);
+  console.log(`[SELF-TEST, no message sent] tomorrowDateString() = ${tomorrowDateString()} \u2014 formatted as: ${formatDateForMessage(tomorrowDateString())}`);
 
   // Optional: uncomment to run once immediately on startup for testing,
   // instead of waiting for the next 9 AM slot.
