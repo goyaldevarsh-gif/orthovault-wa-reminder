@@ -149,12 +149,10 @@ function buildReminderMessage(patientName, nextFollowUpDate, isOverdue, doctorNa
   const rescheduleLine = clinicPhone
     ? `\n\nअगर आप नहीं आ पा रहे, कृपया ${clinicPhone} पर कॉल करके नई तारीख तय कर लें, ताकि इलाज बीच में न रुके।`
     : '';
-  const replyBlock = `\n\nरिप्लाई करें / Please reply:\n✅ आ रहे हैं? "YES" लिखें\n📅 डेट बदलनी है? नई डेट लिखें (जैसे: 20/9)`;
   return `नमस्ते ${patientName} जी,`
     + dateLine
     + `\n\nकृपया साथ लाएं:\n✅ पुराने X-ray/MRI/CT रिपोर्ट\n✅ चल रही दवाइयां`
     + rescheduleLine
-    + replyBlock
     + `\n\nधन्यवाद,\n${doctorName || 'आपका डॉक्टर'}`
     + (signature || '');
 }
@@ -398,6 +396,14 @@ async function startWhatsApp() {
   }
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    // \u26a0\ufe0f Reply-detection (YES/date auto-parsing) is DISABLED as of Sept 2026.
+    // WhatsApp's LID privacy rollout means incoming replies can't be reliably matched
+    // back to a patient (tried: remoteJidAlt, Baileys' internal lidMapping, and a
+    // proactive onWhatsApp()-based phone\u2192LID lookup \u2014 none worked reliably). Revisit
+    // this once Baileys/WhatsApp's LID handling matures, or switch to the official
+    // Meta Business API (real phone numbers, no LID issue). Delete the line below to
+    // re-enable \u2014 all the matching/parsing logic underneath is untouched and ready.
+    return;
     if (type !== 'notify') return;
     for (const msg of messages) {
       try {
@@ -486,7 +492,7 @@ async function startWhatsApp() {
       lastQrDataUrl = null;
       console.log('✅ WhatsApp connected.');
       scheduleDailyJob(sock);
-      buildPhoneToLidMap(sock).catch(err => console.error('Initial LID map build failed:', err.message));
+      // buildPhoneToLidMap(sock).catch(err => console.error('Initial LID map build failed:', err.message)); // disabled with reply-detection, see note above
     }
   });
 
@@ -498,7 +504,7 @@ function scheduleDailyJob(sock) {
   if (cronScheduled) return; // avoid double-scheduling across reconnects
   cronScheduled = true;
   cron.schedule(DAILY_CRON_SCHEDULE, () => {
-    buildPhoneToLidMap(sock).catch(err => console.error('Daily LID map rebuild failed:', err.message));
+    // buildPhoneToLidMap(sock).catch(err => console.error('Daily LID map rebuild failed:', err.message)); // disabled with reply-detection, see note above
     runDailyReminderJob(sock).catch(err => console.error('Daily job crashed:', err));
   }, { timezone: CRON_TIMEZONE });
   console.log(`Scheduled daily reminder run for ${DAILY_CRON_SCHEDULE} (${CRON_TIMEZONE}).`);
