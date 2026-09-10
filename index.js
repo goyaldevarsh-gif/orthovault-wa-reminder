@@ -328,6 +328,34 @@ async function startWhatsApp() {
 
   sock.ev.on('creds.update', saveCreds);
 
+  // WhatsApp is mid-rollout of "LID" (Linked ID) \u2014 a privacy identifier that replaces
+  // the actual phone number in remoteJid for some/most accounts. This tries every known
+  // way to recover the real phone number before giving up, since our whole patient-matching
+  // depends on it. See WhiskeySockets/Baileys #1718, #2414, #2551 for background.
+  async function resolveSenderPhoneDigits(msg) {
+    const remoteJid = msg.key.remoteJid || '';
+
+    // Layer 1: not a LID at all \u2014 the normal, old-style JID already has the phone number.
+    if (remoteJid.endsWith('@s.whatsapp.net')) {
+      return remoteJid.replace('@s.whatsapp.net', '').replace(/\D/g, '');
+    }
+
+    // Layer 2: WhatsApp often sends the phone-based JID alongside the LID as an "Alt" field.
+    if (msg.key.remoteJidAlt && msg.key.remoteJidAlt.includes('@')) {
+      return msg.key.remoteJidAlt.replace(/@.*/, '').replace(/\D/g, '');
+    }
+
+    // Layer 3: ask Baileys' own LID\u2192phone-number mapping table, if it has this LID cached.
+    try {
+      if (sock.signalRepository?.lidMapping?.getPNForLID) {
+        const pn = await sock.signalRepository.lidMapping.getPNForLID(remoteJid);
+        if (pn) return String(pn).replace(/@.*/, '').replace(/\D/g, '');
+      }
+    } catch (e) { /* mapping not available yet \u2014 fall through */ }
+
+    return null; // couldn't resolve \u2014 caller should treat this as "unknown sender"
+  }
+
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
     for (const msg of messages) {
@@ -337,9 +365,14 @@ async function startWhatsApp() {
         const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
         if (!text.trim()) continue;
 
-        const senderJid = msg.key.remoteJid;
         console.log(`[DEBUG] Raw message key:`, JSON.stringify(msg.key));
-        const senderDigits = senderJid.replace('@s.whatsapp.net', '').replace(/\D/g, '');
+        const senderJid = msg.key.remoteJid; // used to reply \u2014 WhatsApp accepts this even when it's a @lid
+        const senderDigits = await resolveSenderPhoneDigits(msg);
+        if (!senderDigits) {
+          console.log(`Reply with text "${text}" \u2014 could not resolve sender's phone number from this WhatsApp identity (LID unmapped), ignoring.`);
+          continue;
+        }
+        console.log(`[DEBUG] Resolved sender phone digits: ${senderDigits}`);
 
         const intent = parseReplyIntent(text);
         if (intent.type === 'unknown') {
