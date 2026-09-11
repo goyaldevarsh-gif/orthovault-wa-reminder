@@ -195,6 +195,23 @@ function generateSignature(profile) {
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
+// Retries a send up to 3 times with increasing delay \u2014 the WhatsApp connection
+// occasionally drops/reconnects on its own (normal for this unofficial route), and
+// without this, a message that happens to fire during exactly that moment would
+// permanently fail for the day since the cron only runs once.
+async function sendMessageWithRetry(sock, jid, text, attempt = 1) {
+  const MAX_ATTEMPTS = 3;
+  const DELAYS_MS = [5000, 15000, 30000];
+  try {
+    await sock.sendMessage(jid, { text });
+  } catch (err) {
+    if (attempt >= MAX_ATTEMPTS) throw err;
+    console.log(`  \u26a0 Send attempt ${attempt} failed (${err.message}), retrying in ${DELAYS_MS[attempt-1]/1000}s...`);
+    await sleep(DELAYS_MS[attempt-1]);
+    return sendMessageWithRetry(sock, jid, text, attempt + 1);
+  }
+}
+
 // ---- Proactive LID resolution ----
 // WhatsApp's LID privacy system (see resolveSenderPhoneDigits below for background) means an
 // incoming reply's remoteJid is often an opaque @lid with no direct link back to the phone
@@ -324,7 +341,7 @@ async function runDailyReminderJob(sock) {
       const signature = generateSignature(profile);
       const message = buildReminderMessage(patient.name || 'Patient', patient.nextFollowUpDate, isOverdue, profile.doctorName, profile.clinicPhone, signature);
 
-      await sock.sendMessage(jid, { text: message });
+      await sendMessageWithRetry(sock, jid, message);
       await patientRef.set({ lastAutoReminderSentAt: Date.now() }, { merge: true });
       sent++;
       console.log(`  ✓ Sent to ${patient.name}`);
@@ -507,7 +524,13 @@ function scheduleDailyJob(sock) {
     // buildPhoneToLidMap(sock).catch(err => console.error('Daily LID map rebuild failed:', err.message)); // disabled with reply-detection, see note above
     runDailyReminderJob(sock).catch(err => console.error('Daily job crashed:', err));
   }, { timezone: CRON_TIMEZONE });
-  console.log(`Scheduled daily reminder run for ${DAILY_CRON_SCHEDULE} (${CRON_TIMEZONE}).`);
+  // Catch-up run 2 hours later \u2014 if the WhatsApp connection was mid-reconnect during the
+  // 9 AM run and a send failed, this naturally retries only that patient (everyone already
+  // sent gets skipped via the lastAutoReminderSentAt check already in runDailyReminderJob).
+  cron.schedule('0 11 * * *', () => {
+    runDailyReminderJob(sock).catch(err => console.error('Catch-up job crashed:', err));
+  }, { timezone: CRON_TIMEZONE });
+  console.log(`Scheduled daily reminder run for ${DAILY_CRON_SCHEDULE} (${CRON_TIMEZONE}), with an 11 AM catch-up retry.`);
   console.log(`[SELF-TEST, no message sent] tomorrowDateString() = ${tomorrowDateString()} \u2014 formatted as: ${formatDateForMessage(tomorrowDateString())}`);
 
   // Optional: uncomment to run once immediately on startup for testing,
