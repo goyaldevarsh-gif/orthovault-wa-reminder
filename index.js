@@ -141,11 +141,12 @@ function toWaJid(raw) {
   if (digits.length === 10) digits = '91' + digits;
   return digits + '@s.whatsapp.net';
 }
-function buildReminderMessage(patientName, nextFollowUpDate, isOverdue, doctorName, clinicPhone, signature) {
+function buildReminderMessage(patientName, nextFollowUpDate, isOverdue, doctorName, clinicPhone, signature, purpose) {
   const dateFormatted = formatDateForMessage(nextFollowUpDate);
+  const purposeSuffix = purpose ? ` — ${purpose} के लिए।` : '';
   const dateLine = isOverdue
-    ? `\nआपकी फॉलो-अप विज़िट ${dateFormatted} को रखी गई थी।`
-    : `\nआपकी अगली फॉलो-अप विज़िट ${dateFormatted} को है — आपका इलाज कैसा चल रहा है, यह देखने के लिए यह ज़रूरी है।`;
+    ? `\nआपकी फॉलो-अप विज़िट ${dateFormatted} को रखी गई थी।${purpose ? ` (${purpose} के लिए)` : ''}`
+    : `\nआपकी अगली फॉलो-अप विज़िट ${dateFormatted} को है${purpose ? purposeSuffix : ' — आपका इलाज कैसा चल रहा है, यह देखने के लिए यह ज़रूरी है।'}`;
   const rescheduleLine = clinicPhone
     ? `\n\nअगर आप नहीं आ पा रहे, कृपया ${clinicPhone} पर कॉल करके नई तारीख तय कर लें, ताकि इलाज बीच में न रुके।`
     : '';
@@ -339,7 +340,7 @@ async function runDailyReminderJob(sock) {
       const profile = await getDoctorProfileFields(doctorUid);
       const isOverdue = false; // always false here \u2014 we're reminding a day ahead, never for a past date
       const signature = generateSignature(profile);
-      const message = buildReminderMessage(patient.name || 'Patient', patient.nextFollowUpDate, isOverdue, profile.doctorName, profile.clinicPhone, signature);
+      const message = buildReminderMessage(patient.name || 'Patient', patient.nextFollowUpDate, isOverdue, profile.doctorName, profile.clinicPhone, signature, patient.followUpPurpose || '');
 
       await sendMessageWithRetry(sock, jid, message);
       await patientRef.set({ lastAutoReminderSentAt: Date.now() }, { merge: true });
